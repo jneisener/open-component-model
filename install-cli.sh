@@ -10,7 +10,6 @@ set -euo pipefail
 DEFAULT_BIN_DIR="${HOME}/.local/bin"
 BIN_DIR=${1:-"${DEFAULT_BIN_DIR}"}
 GITHUB_REPO="open-component-model/open-component-model"
-TAG_PREFIX="cli/"
 
 usage() {
     cat <<EOF
@@ -22,12 +21,13 @@ Arguments:
   BIN_DIR    Installation directory (default: ~/.local/bin)
 
 Environment variables:
-  OCM_VERSION       Install a specific version (e.g., OCM_VERSION=1.0.0)
+  OCM_VERSION       Install a specific version (e.g., OCM_VERSION=1.0.0) or the latest version of a major.minor series (e.g., OCM_VERSION=0.9)
   OCM_SKIP_VERIFY   Skip attestation verification (set to "true")
 
 Examples:
   curl -sfL https://ocm.software/install-cli.sh | bash
   curl -sfL https://ocm.software/install-cli.sh | OCM_VERSION=1.0.0 bash
+  curl -sfL https://ocm.software/install-cli.sh | OCM_VERSION=0.9 bash
   curl -sfL https://ocm.software/install-cli.sh | bash -s -- /usr/local/bin
 EOF
     exit 0
@@ -103,9 +103,10 @@ ensure_path() {
     esac
 
     warn "${BIN_DIR} is not in your PATH."
-    warn "Add it by running:"
+    warn "Add it by adding this line to your shell profile"
+    warn "(e.g. ~/.zshrc for zsh, or ~/.bashrc / ~/.profile for bash / sh):"
     warn ""
-    warn '  echo "export PATH=${BIN_DIR}:$PATH" >> ~/.profile && source ~/.profile'
+    warn "  export PATH=\"\$PATH:${BIN_DIR}\""
     warn ""
 }
 
@@ -134,19 +135,48 @@ setup_tmp() {
 
 # Extract a stable CLI version from a releases JSON file.
 # Returns the version string (e.g. "0.3.0") or empty if none found.
+# The trailing `"` in the regex anchors the match to the JSON quote, so it
+# implicitly excludes pre-releases like `"v0.8.0-rc.1"`. We then `sort -V` and
+# pick the highest semver rather than relying on GitHub's API order, which is
+# created_at-desc and would mis-rank a back-patched release on an older minor
+# (e.g. a v0.7.1 hotfix created after v0.8.0 has shipped).
 extract_stable_version() {
     grep '"tag_name":' "$1" \
-        | grep -E "\"${TAG_PREFIX}v[0-9]+\.[0-9]+\.[0-9]+\"" \
-        | head -1 \
-        | sed -E "s|.*\"${TAG_PREFIX}v([^\"]+)\".*|\1|" \
+        | grep -E "\"v[0-9]+\.[0-9]+\.[0-9]+\"" \
+        | sed -E "s|.*\"v([^\"]+)\".*|\1|" \
+        | sort -V \
+        | tail -1 \
         || true # grep returns non-zero when no lines match; prevent set -e from killing the subshell
+}
+
+# Extract the latest stable version matching a MAJOR.MINOR prefix from a releases JSON file.
+extract_stable_version_for_minor() {
+    local minor_prefix="$1"
+    grep '"tag_name":' "$2" \
+        | grep -E "\"v${minor_prefix}\.[0-9]+\"" \
+        | sed -E "s|.*\"v([^\"]+)\".*|\1|" \
+        | sort -V \
+        | tail -1 \
+        || true
 }
 
 # Find version from Github metadata
 get_release_version() {
-    if [[ -z "${OCM_VERSION:-}" ]]; then
-        # Use the list endpoint so we can filter by TAG_PREFIX; /releases/latest may
-        # point to a non-CLI release (e.g. a website or docs tag published more recently).
+    if [[ -n "${OCM_VERSION:-}" ]]; then
+        # If OCM_VERSION is a partial minor (e.g. "0.9"), resolve to the latest patch release.
+        if [[ "${OCM_VERSION}" =~ ^[0-9]+\.[0-9]+$ ]]; then
+            METADATA_URL="https://api.github.com/repos/${GITHUB_REPO}/releases?per_page=100"
+            info "Downloading metadata ${METADATA_URL}"
+            download "${TMP_METADATA}" "${METADATA_URL}"
+
+            local resolved
+            resolved=$(extract_stable_version_for_minor "${OCM_VERSION}" "${TMP_METADATA}")
+            [[ -n "${resolved}" ]] || fatal "No stable release found for ${OCM_VERSION}.x"
+            OCM_VERSION="${resolved}"
+        fi
+    else
+        # Use the list endpoint so we can filter for the canonical CLI tag; /releases/latest
+        # may point to a non-CLI release (e.g. a website or docs tag published more recently).
         METADATA_URL="https://api.github.com/repos/${GITHUB_REPO}/releases?per_page=100"
         info "Downloading metadata ${METADATA_URL}"
         download "${TMP_METADATA}" "${METADATA_URL}"
@@ -154,35 +184,8 @@ get_release_version() {
         OCM_VERSION=$(extract_stable_version "${TMP_METADATA}")
     fi
 
-    if [[ -n "${OCM_VERSION}" ]]; then
-        info "Using ${OCM_VERSION} as release"
-        # Disclaimer: This logic is added so it works with the new _single_ canonical release.
-        # This means that the `cli` prefix for the CLI release dropped in the new release version.
-        # Therefore, for any version install that is 8 or above we strip the TAG_PREFIX='cli' from
-        # the constructed download URL.
-        if ! version_below "${OCM_VERSION}" 8; then
-          TAG_PREFIX=''
-        fi
-    else
-        fatal "Unable to determine release version"
-    fi
-}
-
-# Returns 0 (true) if a "v0.x" version has x strictly below THRESHOLD.
-# Accepts: cli/v0.5, v0.5.0, v0.5.0-rc.1, cli/v0.12.3 ...
-version_below() {
-    local version="$1" threshold="$2"
-
-    [[ "$version" == *0.* ]] || fatal "Not a v0.x version: ${version}"
-
-    # Strip everything up to and including the last "v0." -> "5.0-rc.1"
-    local rest="${version##*0.}"
-
-    # Grab only the leading digits -> "5"
-    [[ "$rest" =~ ^([0-9]+) ]] || fatal "Cannot parse minor from: ${version}"
-    local minor="${BASH_REMATCH[1]}"
-
-    (( minor < threshold ))
+    [[ -n "${OCM_VERSION}" ]] || fatal "Unable to determine release version"
+    info "Using ${OCM_VERSION} as release"
 }
 
 # Download file from URL
@@ -203,9 +206,16 @@ download() {
 }
 
 # Download binary from Github URL
-# Assets follow the naming scheme: ocm-{OS}-{ARCH} (no version, no archive)
+# Assets follow the naming scheme: ocm-{OS}-{ARCH} (no version, no archive).
+# The `cli/` tag prefix was dropped in v0.8.0; older versions still live under it.
+# Legacy iff major==0 AND minor<8 - any 1.x+ release uses the modern bare tag.
 download_binary() {
-    BIN_URL="https://github.com/${GITHUB_REPO}/releases/download/${TAG_PREFIX}v${OCM_VERSION}/ocm-${OS}-${ARCH}"
+    local major minor tag_prefix=''
+    IFS='.' read -r major minor _ <<< "${OCM_VERSION}"
+    if (( major == 0 && minor < 8 )); then
+        tag_prefix='cli/'
+    fi
+    BIN_URL="https://github.com/${GITHUB_REPO}/releases/download/${tag_prefix}v${OCM_VERSION}/ocm-${OS}-${ARCH}"
     info "Downloading binary ${BIN_URL}"
     download "${TMP_BIN}" "${BIN_URL}"
 }
