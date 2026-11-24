@@ -37,7 +37,7 @@ const (
 )
 
 // Test_Integration_TransferNormalized_OCIToOCI_CarriesSignatureReferrer proves the central promise
-// of the normalized OCI layout (ADR 0033) against two real registries: the tag resolves to a
+// of the normalized OCI layout (ADR 0034) against two real registries: the tag resolves to a
 // stable, access-free normalized manifest whose digest (D_norm) is invariant across a
 // registry-to-registry transfer, and a cosign-style signature attached as a referrer of that
 // manifest is carried to the target verbatim. Because the signed bytes (the manifest at D_norm)
